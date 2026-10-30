@@ -10,3 +10,6 @@ pre-commit:
     - name: ty
       glob: "*.py"
       run: uv run ty check
+    - name: jscpd
+      glob: "*.py"
+      run: uv run jscpd app ebooks reverse --pattern "**/*.py"
