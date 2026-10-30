@@ -6,6 +6,8 @@ For development, run `uv sync` and `uv run lefthook install` after cloning.
 The pre-commit hook checks staged Python files with Ruff (lint and formatting)
 and runs ty across the project. Run them manually with `uv run ruff check .`,
 `uv run ruff format --check .`, and `uv run ty check`.
+Ebook extraction failures are recorded in the report and logged with a
+traceback; processing continues with the next source.
 
 ## Parts
 
