@@ -2,6 +2,11 @@
 
 Experiments with hypothetical-document retrieval over Roman-history ebooks stored in Antfly, plus the pipeline that builds that corpus. Install dependencies with `uv sync`.
 
+For development, run `uv sync` and `uv run lefthook install` after cloning.
+The pre-commit hook checks staged Python files with Ruff (lint and formatting)
+and runs ty across the project. Run them manually with `uv run ruff check .`,
+`uv run ruff format --check .`, and `uv run ty check`.
+
 ## Parts
 
 - [`ebooks/`](ebooks/README.md): turns `~/Documents/rome/_raw` (PDF, EPUB, AZW3, DjVu, text) into source-attributed chunks with Unstructured, checks them against the embedding token limit with `tiktoken`, and streams them into Antfly. `monitor.py` is a browser dashboard for extraction and indexing progress.

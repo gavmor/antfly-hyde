@@ -1,0 +1,12 @@
+pre-commit:
+  parallel: true
+  jobs:
+    - name: ruff
+      glob: "*.py"
+      run: uv run ruff check --force-exclude {staged_files}
+    - name: ruff-format
+      glob: "*.py"
+      run: uv run ruff format --check --force-exclude {staged_files}
+    - name: ty
+      glob: "*.py"
+      run: uv run ty check
