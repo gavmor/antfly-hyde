@@ -9,6 +9,8 @@ and jscpd across the Python project. Run them manually with `uv run ruff check .
 `uv run ruff format --check .`, `uv run ruff check --select C901 .`,
 `uv run complexipy app ebooks reverse`, `uv run ty check`, and
 `uv run jscpd app ebooks reverse --pattern "**/*.py"`.
+Complexity checks use Ruff's default McCabe limit of 10 and complexipy's
+default cognitive limit of 15.
 Ebook extraction failures are recorded in the report and logged with a
 traceback; processing continues with the next source.
 

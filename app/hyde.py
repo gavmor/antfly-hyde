@@ -76,30 +76,39 @@ def add_neighbor_context(hits, args):
         hit["context_neighbors"] = neighbors
 
 
+def invalid_number(value):
+    return (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    )
+
+
+def validate_vector_contents(vectors):
+    if not isinstance(vectors[0], list) or not vectors[0]:
+        raise ValueError("expected nonempty dense float vectors, not sparse embeddings")
+    dim = len(vectors[0])
+    if any(not isinstance(v, list) or len(v) != dim for v in vectors):
+        raise ValueError("embedding dimensions differ")
+    if any(invalid_number(x) for v in vectors for x in v):
+        raise ValueError("embedding contains a non-finite or nonnumeric value")
+    return dim
+
+
+def validate_vectors(response, count):
+    data = response["data"]
+    if len(data) != count:
+        raise ValueError("wrong number of embeddings")
+    by_index = {item["index"]: item["embedding"] for item in data}
+    if set(by_index) != set(range(count)):
+        raise ValueError("missing or duplicated embedding indexes")
+    vectors = [by_index[i] for i in range(count)]
+    return vectors, validate_vector_contents(vectors)
+
+
 def pooled_vectors(response, count):
     try:
-        data = response["data"]
-        if len(data) != count:
-            raise ValueError("wrong number of embeddings")
-        by_index = {item["index"]: item["embedding"] for item in data}
-        if set(by_index) != set(range(count)):
-            raise ValueError("missing or duplicated embedding indexes")
-        vectors = [by_index[i] for i in range(count)]
-        if not isinstance(vectors[0], list) or not vectors[0]:
-            raise ValueError(
-                "expected nonempty dense float vectors, not sparse embeddings"
-            )
-        dim = len(vectors[0])
-        if any(not isinstance(v, list) or len(v) != dim for v in vectors):
-            raise ValueError("embedding dimensions differ")
-        if any(
-            isinstance(x, bool)
-            or not isinstance(x, (int, float))
-            or not math.isfinite(x)
-            for v in vectors
-            for x in v
-        ):
-            raise ValueError("embedding contains a non-finite or nonnumeric value")
+        vectors, dim = validate_vectors(response, count)
         mean = [sum(v[i] for v in vectors) / count for i in range(dim)]
         norm = math.sqrt(sum(x * x for x in mean))
         if not math.isfinite(norm) or norm == 0:
@@ -109,22 +118,23 @@ def pooled_vectors(response, count):
         raise SearchError(f"invalid embedding response: {exc}") from exc
 
 
-def rerank(hits, args):
-    documents = []
-    for hit in hits:
-        source = hit.get("_source")
-        value = source
-        for part in args.rerank_field.split("."):
-            if not isinstance(value, dict) or part not in value:
-                raise SearchError(
-                    f"hit {hit.get('_id', '?')} has no rerank field {args.rerank_field!r} in _source"
-                )
-            value = value[part]
-        if not isinstance(value, str) or not value.strip():
+def rerank_document(hit, field):
+    value = hit.get("_source")
+    for part in field.split("."):
+        if not isinstance(value, dict) or part not in value:
             raise SearchError(
-                f"hit {hit.get('_id', '?')} rerank field must be a nonempty string"
+                f"hit {hit.get('_id', '?')} has no rerank field {field!r} in _source"
             )
-        documents.append(value)
+        value = value[part]
+    if not isinstance(value, str) or not value.strip():
+        raise SearchError(
+            f"hit {hit.get('_id', '?')} rerank field must be a nonempty string"
+        )
+    return value
+
+
+def rerank(hits, args):
+    documents = [rerank_document(hit, args.rerank_field) for hit in hits]
     if not documents:
         return hits
     result = post(
@@ -134,22 +144,24 @@ def rerank(hits, args):
         args.timeout,
     )
     try:
-        scores = result["data"]
-        by_index = {entry["index"]: entry["score"] for entry in scores}
-        if len(scores) != len(hits) or set(by_index) != set(range(len(hits))):
-            raise ValueError("missing or duplicate scores")
-        if any(
-            isinstance(x, bool)
-            or not isinstance(x, (int, float))
-            or not math.isfinite(x)
-            for x in by_index.values()
-        ):
-            raise ValueError("scores must be finite numbers")
-        for i, hit in enumerate(hits):
-            hit["_rerank_score"] = by_index[i]
-        return sorted(hits, key=lambda h: h["_rerank_score"], reverse=True)
+        return apply_rerank_scores(hits, result)
     except (KeyError, TypeError, ValueError) as exc:
         raise SearchError(f"invalid rerank response: {exc}") from exc
+
+
+def apply_rerank_scores(hits, result):
+    scores = result["data"]
+    by_index = {entry["index"]: entry["score"] for entry in scores}
+    if len(scores) != len(hits) or set(by_index) != set(range(len(hits))):
+        raise ValueError("missing or duplicate scores")
+    if any(
+        isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x)
+        for x in by_index.values()
+    ):
+        raise ValueError("scores must be finite numbers")
+    for i, hit in enumerate(hits):
+        hit["_rerank_score"] = by_index[i]
+    return sorted(hits, key=lambda h: h["_rerank_score"], reverse=True)
 
 
 def openai_vectors(prompt, args):
@@ -254,6 +266,57 @@ def gemini_vectors(prompt, args):
         ) from None
 
 
+def compatible_vectors(prompt, args):
+    passages = []
+    for _ in range(args.samples):
+        result = post(
+            args.generate_url,
+            {
+                "model": args.generator_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": args.temperature,
+                "max_tokens": args.max_tokens,
+                "stream": False,
+            },
+            args.inference_token,
+            args.timeout,
+        )
+        try:
+            text = result["choices"][0]["message"]["content"]
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("empty generated passage")
+            passages.append(text.strip())
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise SearchError(f"invalid generation response: {exc}") from exc
+    embed_payload = {"model": args.embed_model, "input": passages}
+    if args.document_task:
+        embed_payload["task_type"] = "RETRIEVAL_DOCUMENT"
+    vectors = post(args.embed_url, embed_payload, args.inference_token, args.timeout)
+    return passages, pooled_vectors(vectors, len(passages))
+
+
+def parse_query_response(response):
+    try:
+        results = response["responses"]
+        if (
+            not isinstance(results, list)
+            or len(results) != 1
+            or not isinstance(results[0], dict)
+        ):
+            raise ValueError("expected exactly one query result")
+        result = results[0]
+        if result.get("error") or result.get("status", 200) >= 400:
+            raise SearchError(
+                f"Antfly query failed: {result.get('error', result.get('status'))}"
+            )
+        hits = result["hits"]["hits"]
+        if not isinstance(hits, list):
+            raise TypeError("hits must be a list")
+        return result, hits
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SearchError(f"invalid Antfly query response: {exc}") from exc
+
+
 def run(args):
     if not args.query.strip():
         raise SearchError("query must not be empty")
@@ -267,34 +330,7 @@ def run(args):
     elif args.provider == "gemini":
         passages, vector = gemini_vectors(prompt, args)
     else:
-        passages = []
-        for _ in range(args.samples):
-            result = post(
-                args.generate_url,
-                {
-                    "model": args.generator_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": args.temperature,
-                    "max_tokens": args.max_tokens,
-                    "stream": False,
-                },
-                args.inference_token,
-                args.timeout,
-            )
-            try:
-                text = result["choices"][0]["message"]["content"]
-                if not isinstance(text, str) or not text.strip():
-                    raise ValueError("empty generated passage")
-                passages.append(text.strip())
-            except (KeyError, IndexError, TypeError, ValueError) as exc:
-                raise SearchError(f"invalid generation response: {exc}") from exc
-        embed_payload = {"model": args.embed_model, "input": passages}
-        if args.document_task:
-            embed_payload["task_type"] = "RETRIEVAL_DOCUMENT"
-        vectors = post(
-            args.embed_url, embed_payload, args.inference_token, args.timeout
-        )
-        vector = pooled_vectors(vectors, len(passages))
+        passages, vector = compatible_vectors(prompt, args)
     request = {
         "table": args.table,
         "full_text_search": {"match": args.query},
@@ -318,24 +354,7 @@ def run(args):
         args.antfly_token,
         args.timeout,
     )
-    try:
-        results = response["responses"]
-        if (
-            not isinstance(results, list)
-            or len(results) != 1
-            or not isinstance(results[0], dict)
-        ):
-            raise ValueError("expected exactly one query result")
-        result = results[0]
-        if result.get("error") or result.get("status", 200) >= 400:
-            raise SearchError(
-                f"Antfly query failed: {result.get('error', result.get('status'))}"
-            )
-        hits = result["hits"]["hits"]
-        if not isinstance(hits, list):
-            raise TypeError("hits must be a list")
-    except (KeyError, TypeError, ValueError) as exc:
-        raise SearchError(f"invalid Antfly query response: {exc}") from exc
+    result, hits = parse_query_response(response)
     if args.rerank_model:
         hits = rerank(hits, args)
     hits = hits[: args.limit]
@@ -363,6 +382,49 @@ def nonnegative(value):
     if not math.isfinite(n) or n < 0:
         raise argparse.ArgumentTypeError("must be finite and nonnegative")
     return n
+
+
+def configure_models(args, parser):
+    if args.provider == "openai":
+        args.generator_model = args.generator_model or "gpt-4.1-mini"
+        args.embed_model = args.embed_model or "text-embedding-3-small"
+    elif args.provider == "gemini":
+        args.generator_model = args.generator_model or "gemini-3.1-flash-lite"
+        args.embed_model = args.embed_model or "gemini-embedding-001"
+    elif not args.generator_model or not args.embed_model:
+        parser.error(
+            "--generator-model and --embed-model are required for the compatible provider"
+        )
+
+
+def validate_args(args, parser):
+    if args.candidates < args.limit and args.rerank_model:
+        parser.error("--candidates must be at least --limit")
+    if args.temperature > 2:
+        parser.error("--temperature must be at most 2")
+    if args.lexical_weight == 0 and args.dense_weight == 0:
+        parser.error("at least one fusion weight must be positive")
+
+
+def brief_result(result):
+    return {
+        "hypothetical_documents": result["hypothetical_documents"],
+        "hits": [
+            {
+                "source": h["_source"].get("source_relative_path"),
+                "pages": h["_source"].get("page_numbers"),
+                "id": h["_id"],
+                "scores": h.get("_index_scores"),
+                "passage": h["_source"].get("body"),
+                **(
+                    {"neighbors": [n.get("body") for n in h["context_neighbors"]]}
+                    if "context_neighbors" in h
+                    else {}
+                ),
+            }
+            for h in result["hits"]
+        ],
+    }
 
 
 def main():
@@ -441,49 +503,14 @@ def main():
         help="one compact record per hit (source, pages, id, passage) instead of raw Antfly JSON",
     )
     args = p.parse_args()
-    if args.provider == "openai":
-        args.generator_model = args.generator_model or "gpt-4.1-mini"
-        args.embed_model = args.embed_model or "text-embedding-3-small"
-    elif args.provider == "gemini":
-        args.generator_model = args.generator_model or "gemini-3.1-flash-lite"
-        args.embed_model = args.embed_model or "gemini-embedding-001"
-    elif not args.generator_model or not args.embed_model:
-        p.error(
-            "--generator-model and --embed-model are required for the compatible provider"
-        )
+    configure_models(args, p)
     args.antfly_token = os.environ.get("ANTFLY_API_KEY")
     args.inference_token = os.environ.get("INFERENCE_API_KEY")
-    if args.candidates < args.limit and args.rerank_model:
-        p.error("--candidates must be at least --limit")
-    if args.temperature > 2:
-        p.error("--temperature must be at most 2")
-    if args.lexical_weight == 0 and args.dense_weight == 0:
-        p.error("at least one fusion weight must be positive")
+    validate_args(args, p)
     try:
         result = run(args)
         if args.brief:
-            result = {
-                "hypothetical_documents": result["hypothetical_documents"],
-                "hits": [
-                    {
-                        "source": h["_source"].get("source_relative_path"),
-                        "pages": h["_source"].get("page_numbers"),
-                        "id": h["_id"],
-                        "scores": h.get("_index_scores"),
-                        "passage": h["_source"].get("body"),
-                        **(
-                            {
-                                "neighbors": [
-                                    n.get("body") for n in h["context_neighbors"]
-                                ]
-                            }
-                            if "context_neighbors" in h
-                            else {}
-                        ),
-                    }
-                    for h in result["hits"]
-                ],
-            }
+            result = brief_result(result)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
     except SearchError as exc:
         print(f"hyde: {exc}", file=sys.stderr)

@@ -45,33 +45,31 @@ def digest_file(path):
     return digest.hexdigest()
 
 
+def collect_epub_targets(items, parents, targets):
+    for item in items:
+        if isinstance(item, tuple):
+            section, children = item
+            title = getattr(section, "title", None)
+            hierarchy = parents + ([title.strip()] if title and title.strip() else [])
+            href = getattr(section, "href", None)
+            if href and hierarchy:
+                targets.setdefault(unquote(urldefrag(href)[0]), set()).add(
+                    tuple(hierarchy)
+                )
+            collect_epub_targets(children, hierarchy, targets)
+        else:
+            title, href = getattr(item, "title", None), getattr(item, "href", None)
+            if href and title and title.strip():
+                targets.setdefault(unquote(urldefrag(href)[0]), set()).add(
+                    tuple(parents + [title.strip()])
+                )
+
+
 def epub_groups(path):
     """Partition EPUB spine documents using EbookLib's navigation hierarchy."""
     book = epub.read_epub(str(path))
     targets = {}
-
-    def collect(items, parents):
-        for item in items:
-            if isinstance(item, tuple):
-                section, children = item
-                title = getattr(section, "title", None)
-                hierarchy = parents + (
-                    [title.strip()] if title and title.strip() else []
-                )
-                href = getattr(section, "href", None)
-                if href and hierarchy:
-                    targets.setdefault(unquote(urldefrag(href)[0]), set()).add(
-                        tuple(hierarchy)
-                    )
-                collect(children, hierarchy)
-            else:
-                title, href = getattr(item, "title", None), getattr(item, "href", None)
-                if href and title and title.strip():
-                    targets.setdefault(unquote(urldefrag(href)[0]), set()).add(
-                        tuple(parents + [title.strip()])
-                    )
-
-    collect(book.toc, [])
+    collect_epub_targets(book.toc, [], targets)
     groups = []
     ambiguous = []
     for item_id, _linear in book.spine:
@@ -96,35 +94,37 @@ def epub_groups(path):
     return groups, warning
 
 
+def extract_pdf(path):
+    elements = partition_pdf(filename=str(path), strategy="fast")
+    if elements:
+        return [(elements, [])], None
+    # Unstructured's fast parser returns nothing for some PDFs that have a text
+    # layer; fall back to poppler, keeping page numbers from its form-feeds.
+    if not shutil.which("pdftotext"):
+        raise RuntimeError("required executable not found: pdftotext")
+    result = subprocess.run(
+        ["pdftotext", "-enc", "UTF-8", str(path), "-"],
+        capture_output=True,
+        check=False,
+        text=True,
+        errors="replace",
+    )
+    if result.returncode:
+        raise RuntimeError(
+            f"pdftotext exited {result.returncode}: {result.stderr.strip()}"
+        )
+    elements = []
+    for number, page in enumerate(result.stdout.split("\f"), 1):
+        for element in partition_text(text=page):
+            element.metadata.page_number = number
+            elements.append(element)
+    return [(elements, [])], "Unstructured fast extraction was empty; used pdftotext"
+
+
 def extract(path):
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        elements = partition_pdf(filename=str(path), strategy="fast")
-        if elements:
-            return [(elements, [])], None
-        # Unstructured's fast parser returns nothing for some PDFs that have a text
-        # layer; fall back to poppler, keeping page numbers from its form-feeds.
-        if not shutil.which("pdftotext"):
-            raise RuntimeError("required executable not found: pdftotext")
-        result = subprocess.run(
-            ["pdftotext", "-enc", "UTF-8", str(path), "-"],
-            capture_output=True,
-            check=False,
-            text=True,
-            errors="replace",
-        )
-        if result.returncode:
-            raise RuntimeError(
-                f"pdftotext exited {result.returncode}: {result.stderr.strip()}"
-            )
-        elements = []
-        for number, page in enumerate(result.stdout.split("\f"), 1):
-            for element in partition_text(text=page):
-                element.metadata.page_number = number
-                elements.append(element)
-        return [
-            (elements, [])
-        ], "Unstructured fast extraction was empty; used pdftotext"
+        return extract_pdf(path)
     if suffix == ".epub":
         return epub_groups(path)
     if suffix == ".txt":
@@ -218,6 +218,54 @@ def contextual_text(title, section, body):
     return " > ".join([title] + section) + "\n\n" + body
 
 
+def block_record(block, title, navigation, sections, suffix):
+    body = str(block).strip()
+    if not body:
+        return None
+    originals = block.metadata.orig_elements or []
+    detected_section = next(
+        (sections[item.id] for item in originals if item.id in sections), []
+    )
+    section = list(navigation)
+    for heading in detected_section:
+        if not section or heading != section[-1]:
+            section.append(heading)
+    pages = sorted(
+        {
+            item.metadata.page_number
+            for item in originals
+            if item.metadata.page_number is not None
+        }
+    )
+    record = {
+        "title": title,
+        "body": body,
+        "section": section,
+        "embedding_text": contextual_text(title, section, body),
+    }
+    if suffix == ".pdf":
+        record["page_numbers"] = pages
+    if block.metadata.text_as_html:
+        record["table_html"] = block.metadata.text_as_html
+    return record
+
+
+def attribute_records(checked, path, relative):
+    source_id = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+    ids = [f"ebook:{source_id}:{index:06d}" for index in range(len(checked))]
+    for index, record in enumerate(checked):
+        record.update(
+            id=ids[index],
+            source_path=str(path),
+            source_filename=path.name,
+            source_relative_path=relative,
+            chunk_index=index,
+            previous_id=ids[index - 1] if index else None,
+            next_id=ids[index + 1] if index + 1 < len(ids) else None,
+            content_sha256=hashlib.sha256(record["body"].encode("utf-8")).hexdigest(),
+        )
+
+
 def prepare_records(path, relative, groups, client, size, overlap):
     title = path.stem.strip() or path.name
     title_count = 0
@@ -236,35 +284,11 @@ def prepare_records(path, relative, groups, client, size, overlap):
             combine_text_under_n_chars=0 if path.suffix.lower() == ".epub" else None,
         )
         for block in blocks:
-            body = str(block).strip()
-            if not body:
-                continue
-            originals = block.metadata.orig_elements or []
-            detected_section = next(
-                (sections[item.id] for item in originals if item.id in sections), []
+            record = block_record(
+                block, title, navigation, sections, path.suffix.lower()
             )
-            section = list(navigation)
-            for heading in detected_section:
-                if not section or heading != section[-1]:
-                    section.append(heading)
-            pages = sorted(
-                {
-                    item.metadata.page_number
-                    for item in originals
-                    if item.metadata.page_number is not None
-                }
-            )
-            record = {
-                "title": title,
-                "body": body,
-                "section": section,
-                "embedding_text": contextual_text(title, section, body),
-            }
-            if path.suffix.lower() == ".pdf":
-                record["page_numbers"] = pages
-            if block.metadata.text_as_html:
-                record["table_html"] = block.metadata.text_as_html
-            chunks.append(record)
+            if record is not None:
+                chunks.append(record)
     if not chunks:
         raise ValueError(
             "no extractable text (possibly scanned, empty, encrypted, or corrupt; OCR is not performed)"
@@ -276,23 +300,21 @@ def prepare_records(path, relative, groups, client, size, overlap):
         checked.extend(
             checked_chunks(client, chunks[start : start + 32], size, overlap)
         )
-    source_id = hashlib.sha256(relative.encode("utf-8")).hexdigest()
-    ids = [f"ebook:{source_id}:{index:06d}" for index in range(len(checked))]
-    for index, record in enumerate(checked):
-        record.update(
-            id=ids[index],
-            source_path=str(path),
-            source_filename=path.name,
-            source_relative_path=relative,
-            chunk_index=index,
-            previous_id=ids[index - 1] if index else None,
-            next_id=ids[index + 1] if index + 1 < len(ids) else None,
-            content_sha256=hashlib.sha256(record["body"].encode("utf-8")).hexdigest(),
-        )
+    attribute_records(checked, path, relative)
     return checked, title_count
 
 
-def main():
+def output_is_in_sources(output, report_path, directories):
+    return any(
+        output == directory
+        or directory in output.parents
+        or report_path == directory
+        or directory in report_path.parents
+        for directory in directories
+    )
+
+
+def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--source-root", type=Path, default=Path("/home/user/Documents/rome/_raw")
@@ -322,17 +344,14 @@ def main():
         )
     output = args.output.expanduser().resolve()
     report_path = args.report.expanduser().resolve()
-    if output == report_path or any(
-        output == d
-        or d in output.parents
-        or report_path == d
-        or d in report_path.parents
-        for d in directories
-    ):
+    if output == report_path or output_is_in_sources(output, report_path, directories):
         parser.error(
             "output and report must be distinct and outside source directories"
         )
-    client = tiktoken.get_encoding(ENCODING)
+    return args, root, directories, output, report_path
+
+
+def source_files(directories):
     files = []
     for directory in directories:
         files.extend(
@@ -350,6 +369,90 @@ def main():
                 key=lambda p: str(p),
             )
         )
+    return files
+
+
+def extract_clean(path, timeout):
+    # Corrupt PDFs can send the pure-Python parser into very long scans.
+    def on_timeout(_signum, _frame):
+        raise SourceTimeout(f"partitioning exceeded {timeout}s; source skipped")
+
+    signal.signal(signal.SIGALRM, on_timeout)
+    signal.alarm(timeout)
+    try:
+        groups, warning = extract(path)
+    finally:
+        signal.alarm(0)
+    # Only discard margin material that the partitioner explicitly classifies.
+    groups = [
+        (
+            [
+                element
+                for element in elements
+                if element.category not in {"Header", "Footer"}
+            ],
+            section,
+        )
+        for elements, section in groups
+    ]
+    clean = " ".join(
+        " ".join(str(element).replace("\x00", " ").split())
+        for elements, _section in groups
+        for element in elements
+    ).strip()
+    if not clean:
+        raise ValueError(
+            "no extractable text (possibly scanned, empty, encrypted, or corrupt; OCR is not performed)"
+        )
+    return groups, warning, hashlib.sha256(clean.encode("utf-8")).hexdigest()
+
+
+def add_source_warnings(entry, path, records, titles):
+    if path.suffix.lower() == ".epub":
+        entry["detected_titles"] = titles
+        if not titles:
+            entry["section_warning"] = (
+                "No unambiguous EPUB navigation or Title elements; chapter breadcrumbs are unavailable"
+            )
+    if path.suffix.lower() == ".pdf":
+        missing_pages = sum(not record["page_numbers"] for record in records)
+        if missing_pages:
+            entry["page_warning"] = (
+                f"{missing_pages} chunks have no original-element page metadata"
+            )
+
+
+def process_source(path, relative, entry, out, args, client, byte_hashes, text_hashes):
+    file_hash = digest_file(path)
+    entry["sha256"] = file_hash
+    if file_hash in byte_hashes:
+        entry.update(status="duplicate_bytes", duplicate_of=byte_hashes[file_hash])
+        return 0
+    groups, warning, text_hash = extract_clean(path, args.source_timeout)
+    entry["text_sha256"] = text_hash
+    if warning:
+        entry["warning"] = warning
+    if text_hash in text_hashes:
+        byte_hashes[file_hash] = relative
+        entry.update(status="duplicate_text", duplicate_of=text_hashes[text_hash])
+        return 0
+    records, titles = prepare_records(
+        path, relative, groups, client, args.chunk_size, args.overlap
+    )
+    add_source_warnings(entry, path, records, titles)
+    for record in records:
+        out.write(json.dumps(record, ensure_ascii=False) + "\n")
+    out.flush()
+    byte_hashes[file_hash] = relative
+    text_hashes[text_hash] = relative
+    entry.update(status="indexed", chunks=len(records))
+    return len(records)
+
+
+def main():
+    args, root, directories, output, report_path = parse_arguments()
+    client = tiktoken.get_encoding(ENCODING)
+    files = source_files(directories)
     byte_hashes, text_hashes, entries = {}, {}, []
     total_chunks = 0
     # The dashboard treats existence of a valid report as completion.
@@ -360,82 +463,9 @@ def main():
             entry = {"source_path": str(path), "relative_path": relative}
             entries.append(entry)
             try:
-                file_hash = digest_file(path)
-                entry["sha256"] = file_hash
-                if file_hash in byte_hashes:
-                    entry.update(
-                        status="duplicate_bytes", duplicate_of=byte_hashes[file_hash]
-                    )
-                    continue
-
-                # Corrupt PDFs can send the pure-Python parser into very long scans.
-                def on_timeout(_signum, _frame):
-                    raise SourceTimeout(
-                        f"partitioning exceeded {args.source_timeout}s; source skipped"
-                    )
-
-                signal.signal(signal.SIGALRM, on_timeout)
-                signal.alarm(args.source_timeout)
-                try:
-                    groups, warning = extract(path)
-                finally:
-                    signal.alarm(0)
-                # Only discard margin material that the partitioner explicitly
-                # classifies; fast PDF extraction does not detect every header/footer.
-                groups = [
-                    (
-                        [
-                            element
-                            for element in elements
-                            if element.category not in {"Header", "Footer"}
-                        ],
-                        section,
-                    )
-                    for elements, section in groups
-                ]
-                clean = " ".join(
-                    " ".join(str(element).replace("\x00", " ").split())
-                    for elements, _section in groups
-                    for element in elements
-                ).strip()
-                if not clean:
-                    raise ValueError(
-                        "no extractable text (possibly scanned, empty, encrypted, or corrupt; OCR is not performed)"
-                    )
-                text_hash = hashlib.sha256(clean.encode("utf-8")).hexdigest()
-                entry["text_sha256"] = text_hash
-                if warning:
-                    entry["warning"] = warning
-                if text_hash in text_hashes:
-                    byte_hashes[file_hash] = relative
-                    entry.update(
-                        status="duplicate_text", duplicate_of=text_hashes[text_hash]
-                    )
-                    continue
-                records, titles = prepare_records(
-                    path, relative, groups, client, args.chunk_size, args.overlap
+                total_chunks += process_source(
+                    path, relative, entry, out, args, client, byte_hashes, text_hashes
                 )
-                if path.suffix.lower() == ".epub":
-                    entry["detected_titles"] = titles
-                    if not titles:
-                        entry["section_warning"] = (
-                            "No unambiguous EPUB navigation or Title elements; chapter breadcrumbs are unavailable"
-                        )
-                if path.suffix.lower() == ".pdf":
-                    missing_pages = sum(
-                        not record["page_numbers"] for record in records
-                    )
-                    if missing_pages:
-                        entry["page_warning"] = (
-                            f"{missing_pages} chunks have no original-element page metadata"
-                        )
-                for record in records:
-                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
-                out.flush()
-                byte_hashes[file_hash] = relative
-                text_hashes[text_hash] = relative
-                total_chunks += len(records)
-                entry.update(status="indexed", chunks=len(records))
             except TokenCountError:
                 raise
             except (Exception, SourceTimeout) as exc:
