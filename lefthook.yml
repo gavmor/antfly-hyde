@@ -4,6 +4,12 @@ pre-commit:
     - name: ruff
       glob: "*.py"
       run: uv run ruff check --force-exclude {staged_files}
+    - name: cyclomatic-complexity
+      glob: "*.py"
+      run: uv run ruff check --select C901 --force-exclude {staged_files}
+    - name: cognitive-complexity
+      glob: "*.py"
+      run: uv run complexipy {staged_files}
     - name: ruff-format
       glob: "*.py"
       run: uv run ruff format --check --force-exclude {staged_files}

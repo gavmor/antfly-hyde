@@ -3,10 +3,12 @@
 Experiments with hypothetical-document retrieval over Roman-history ebooks stored in Antfly, plus the pipeline that builds that corpus. Install dependencies with `uv sync`.
 
 For development, run `uv sync` and `uv run lefthook install` after cloning.
-The pre-commit hook checks staged Python files with Ruff (lint and formatting)
-and runs ty and jscpd across the Python project. Run them manually with
-`uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`,
-and `uv run jscpd app ebooks reverse --pattern "**/*.py"`.
+The pre-commit hook checks staged Python files with Ruff (lint, formatting,
+and cyclomatic complexity) and complexipy (cognitive complexity), and runs ty
+and jscpd across the Python project. Run them manually with `uv run ruff check .`,
+`uv run ruff format --check .`, `uv run ruff check --select C901 .`,
+`uv run complexipy app ebooks reverse`, `uv run ty check`, and
+`uv run jscpd app ebooks reverse --pattern "**/*.py"`.
 Ebook extraction failures are recorded in the report and logged with a
 traceback; processing continues with the next source.
 

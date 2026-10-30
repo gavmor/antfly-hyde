@@ -7,6 +7,8 @@ uv run python - <<'PY'
 import json
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 files = ['app/hyde.py', 'ebooks/monitor.py', 'ebooks/prepare.py', 'reverse/generate.py']
 
@@ -26,6 +28,14 @@ for path in files:
 
 ty = run(['uv', 'run', 'ty', 'check', '--output-format', 'sarif', '--color', 'never'])
 type_issues = sum(1 for run_result in json.loads(ty.stdout)['runs'] for item in run_result['results'] if item.get('level') in ('error', 'warning'))
+cyclomatic = len(json.loads(run(['uv', 'run', 'ruff', 'check', '--select', 'C901', '--output-format', 'json', *files]).stdout))
+with tempfile.TemporaryDirectory() as directory:
+    report = Path(directory) / 'complexity.json'
+    run(['uv', 'run', 'complexipy', '--output-format', 'json', '--output', str(report), *files])
+    cognitive = sum(item['complexity'] > 15 for item in json.loads(report.read_text()))
+print(f'METRIC complexity_issues={cyclomatic + cognitive}')
+print(f'METRIC cyclomatic={cyclomatic}')
+print(f'METRIC cognitive={cognitive}')
 print(f'METRIC issues={lint + formatted + type_issues}')
 print(f'METRIC ruff_diagnostics={lint}')
 print(f'METRIC unformatted_files={formatted}')
