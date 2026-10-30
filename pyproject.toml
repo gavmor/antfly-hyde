@@ -1,0 +1,17 @@
+[project]
+name = "antfly-hyde"
+version = "0.1.0"
+description = "Structure-aware ebook retrieval with Antfly"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "ebooklib>=0.20",
+    "google-genai>=2.33.0",
+    "langchain-text-splitters>=1.1.3",
+    "openai>=3.41.0",
+    "tiktoken>=0.14.0",
+    "tokenizers>=0.23.3",
+    "unstructured[epub,pdf]>=0.18.32",
+]
+
+[tool.uv]
+package = false
